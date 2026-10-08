@@ -1,14 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   BLEND_MODES, BlendMode, Command, EditorDocument, Layer, PixelBuffer, RGBA, Selection,
-  emptySelection, fullSelection,
+  fullSelection,
 } from '../core/contracts';
 import {
-  cloneMask, clonePixels, createDocument, createLayer, createPixelBuffer, flattenTree,
+  cloneLayerDeep, cloneMask, clonePixels, createDocument, createLayer, createPixelBuffer, flattenTree,
 } from '../core/document';
 import { History } from '../core/history';
 import * as C from '../core/commands';
-import { compositeDocument } from '../core/render';
+import { compositeDocument, layerOwnBuffer } from '../core/render';
 import { paintStroke, BrushSettings } from '../engine/brush/brush';
 import { renderGradient } from '../engine/gradient/gradient';
 import {
@@ -58,6 +58,61 @@ const TOOLS: { id: Tool; icon: string; label: string; key: string }[] = [
 ];
 const PALETTE = ['#000000','#ffffff','#ff0000','#ff7f00','#ffff00','#00c853','#2680eb','#7b1fa2','#795548','#9e9e9e','#00bcd4','#e91e63','#8bc34a','#3f51b5'];
 
+/** Per-kind adjustment parameter schemas (UI audit P1-2: the panel used to
+ * render all 14 possible sliders for every kind, most of them inert). */
+const ADJ_SCHEMAS: Record<string, { key: string; label: string; min: number; max: number; step?: number; def: number }[]> = {
+  'brightness-contrast': [
+    { key: 'brightness', label: 'Brightness', min: -100, max: 100, def: 0 },
+    { key: 'contrast', label: 'Contrast', min: -100, max: 100, def: 0 },
+  ],
+  'hue-saturation': [
+    { key: 'hue', label: 'Hue', min: -180, max: 180, def: 0 },
+    { key: 'saturation', label: 'Saturation', min: -100, max: 100, def: 0 },
+    { key: 'lightness', label: 'Lightness', min: -100, max: 100, def: 0 },
+  ],
+  'levels': [
+    { key: 'inBlack', label: 'Input black', min: 0, max: 255, def: 0 },
+    { key: 'inWhite', label: 'Input white', min: 0, max: 255, def: 255 },
+    { key: 'gamma', label: 'Gamma', min: 0.1, max: 3, step: 0.01, def: 1 },
+    { key: 'outBlack', label: 'Output black', min: 0, max: 255, def: 0 },
+    { key: 'outWhite', label: 'Output white', min: 0, max: 255, def: 255 },
+  ],
+  'gamma': [{ key: 'gamma', label: 'Gamma', min: 0.1, max: 3, step: 0.01, def: 1 }],
+  'color-balance': [
+    { key: 'r', label: 'Red', min: -100, max: 100, def: 0 },
+    { key: 'g', label: 'Green', min: -100, max: 100, def: 0 },
+    { key: 'b', label: 'Blue', min: -100, max: 100, def: 0 },
+  ],
+  'invert': [],
+  'grayscale': [],
+  'posterize': [{ key: 'levels', label: 'Levels', min: 2, max: 32, step: 1, def: 4 }],
+  'threshold': [{ key: 'threshold', label: 'Threshold', min: 0, max: 255, def: 128 }],
+};
+const adjDefaults = (kind: string): Record<string, number> =>
+  Object.fromEntries((ADJ_SCHEMAS[kind] ?? []).map(s => [s.key, s.def]));
+
+/** Real layer thumbnail (UI audit P1-3: the old checkerboard span faked
+ * content). Raster/shape/gradient/fill layers draw their actual pixels,
+ * downscaled; group/text/adjustment get honest type glyphs. */
+function LayerThumb({ doc, layer, version }: { doc: EditorDocument; layer: Layer; version: number }) {
+  const ref = useRef<HTMLCanvasElement>(null);
+  useEffect(() => {
+    const cv = ref.current; if (!cv) return;
+    const ctx = cv.getContext('2d')!;
+    ctx.clearRect(0, 0, 30, 30);
+    ctx.fillStyle = '#d8d8d8'; ctx.font = '15px sans-serif'; ctx.textAlign = 'center';
+    if (layer.type === 'group') { ctx.fillText('▦', 15, 21); return; }
+    if (layer.type === 'text') { ctx.fillText('T', 15, 21); return; }
+    if (layer.type === 'adjustment') { ctx.fillText('◐', 15, 21); return; }
+    const buf = layerOwnBuffer(doc, layer); if (!buf) return;
+    const off = document.createElement('canvas'); off.width = buf.width; off.height = buf.height;
+    off.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(buf.data), buf.width, buf.height), 0, 0);
+    const s = Math.min(30 / buf.width, 30 / buf.height);
+    ctx.drawImage(off, (30 - buf.width * s) / 2, (30 - buf.height * s) / 2, buf.width * s, buf.height * s);
+  }, [doc, layer, version]);
+  return <canvas ref={ref} width={30} height={30} className="thumb" aria-hidden />;
+}
+
 function download(blob: Blob, name: string) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = name; a.click();
@@ -91,7 +146,6 @@ export default function App() {
   const [brush, setBrush] = useState<BrushSettings>({ size: 24, hardness: 0.8, opacity: 1, flow: 1, spacing: 0.25, roundness: 1, angleDeg: 0 });
   const [zoom, setZoom] = useState(0.6);
   const [selection, setSelection] = useState<Selection | null>(null);
-  const [selMode] = useState<'replace' | 'add' | 'subtract'>('replace');
   const [menu, setMenu] = useState<string | null>(null);
   const [dialog, setDialog] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -102,6 +156,8 @@ export default function App() {
   const [shapeKind, setShapeKind] = useState<'rectangle' | 'ellipse' | 'rounded-rectangle' | 'polygon' | 'line'>('rectangle');
   const [paintTargetMode, setPaintTargetMode] = useState<'pixels' | 'mask'>('pixels');
   const dragRef = useRef<any>(null);
+  const adjDragRef = useRef<{ layerId: string; before: Layer } | null>(null);
+  const opacityDragRef = useRef<{ layerId: string; before: number } | null>(null);
   const doc = docRef.current;
   const active = doc.activeLayerId ? doc.layers[doc.activeLayerId] : undefined;
   const bump = useCallback(() => setVersion(v => v + 1), []);
@@ -110,6 +166,24 @@ export default function App() {
     setDirty(true); setSaveState('Unsaved changes'); bump();
   }, [bump]);
   const fail = (e: unknown) => setError(e instanceof Error ? e.message : String(e));
+  /** Sliders mutate live during the drag; ONE history entry is committed
+   * at drag end from the before/after snapshots (UI audit P2-6). */
+  const commitAdjDrag = useCallback(() => {
+    const d = adjDragRef.current; adjDragRef.current = null;
+    if (!d) return;
+    const cur = docRef.current.layers[d.layerId];
+    if (!cur?.adjustment || !d.before.adjustment) return;
+    if (JSON.stringify(cur.adjustment.params) === JSON.stringify(d.before.adjustment.params)) return;
+    exec(C.layerDataSnapshotCommand(`Adjust ${cur.adjustment.kind}`, d.layerId, d.before, cloneLayerDeep(cur)));
+  }, [exec]);
+
+  /* Close an open menu on any mousedown outside the menubar. */
+  useEffect(() => {
+    if (!menu) return;
+    const h = (e: MouseEvent) => { if (!(e.target as HTMLElement).closest('.menubar')) setMenu(null); };
+    document.addEventListener('mousedown', h);
+    return () => document.removeEventListener('mousedown', h);
+  }, [menu]);
 
   /* ---------- rendering ---------- */
   useEffect(() => {
@@ -204,8 +278,11 @@ export default function App() {
     if (tool === 'zoom') { setZoom(z => Math.max(0.05, Math.min(8, e.altKey ? z / 1.25 : z * 1.25))); return; }
     if (tool === 'eyedropper') {
       const comp = compositeDocument(d); const i = (p.y * d.width + p.x) * 4;
-      if (p.x >= 0 && p.y >= 0 && p.x < d.width && p.y < d.height) setFg({ r: comp.data[i]!, g: comp.data[i + 1]!, b: comp.data[i + 2]!, a: comp.data[i + 3]! });
-      setTool('brush'); return;
+      if (p.x >= 0 && p.y >= 0 && p.x < d.width && p.y < d.height) {
+        setFg({ r: comp.data[i]!, g: comp.data[i + 1]!, b: comp.data[i + 2]!, a: comp.data[i + 3]! });
+        setTool('brush');
+      }
+      return;
     }
     if (tool === 'text') {
       const l = createLayer('text', d.width, d.height); l.transform.x = p.x; l.transform.y = p.y;
@@ -218,7 +295,12 @@ export default function App() {
       return;
     }
     // brush / eraser / fill
-    const l = paintTarget(); if (!l) { if (active?.locked) setError('Layer is locked.'); return; }
+    const l = paintTarget();
+    if (!l) {
+      if (active?.locked) setError(`“${active.name}” is locked — unlock it in the Layers panel, or add a new layer to paint on.`);
+      else if (active) setError(`A ${active.type} layer can't be painted on — choose a raster layer (or add one with + Layer).`);
+      return;
+    }
     if (tool === 'fill') {
       if (!l.pixels) return;
       const t = l.transform;
@@ -335,6 +417,7 @@ export default function App() {
   };
   const saveProject = () => { try { download(new Blob([serializeProject(docRef.current) as BlobPart], { type: 'application/octet-stream' }), `${docRef.current.name}.wpsc`); setSaveState('Project saved'); setDirty(false); } catch (e) { fail(e); } };
   const openProjectFile = (f: File) => {
+    if (dirty && !window.confirm('Discard unsaved changes and open a different project?')) return;
     if (f.size > LIMITS.maxProjectBytes) { setError('Project file exceeds the size limit.'); return; }
     f.arrayBuffer().then(ab => {
     try { docRef.current = deserializeProject(new Uint8Array(ab)); histRef.current.clear(); setSelection(null); setDirty(false); bump(); }
@@ -401,6 +484,7 @@ export default function App() {
       if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); setSelection(null); return; }
       if (inField) return;
       if (!mod && e.key.toLowerCase() === 'x') { setFg(bg); setBg(fg); return; }
+      if (!mod && e.key.toUpperCase() === 'M') { setTool(e.shiftKey ? (tool === 'rect-select' ? 'ellipse-select' : 'rect-select') : 'rect-select'); return; }
       const t = TOOLS.find(x => x.key === e.key.toUpperCase());
       if (t && !mod) setTool(t.id);
       if (e.key === 'Delete' || e.key === 'Backspace') { if (selection) deleteSelectionPixels(); }
@@ -412,7 +496,7 @@ export default function App() {
 
   const menus: Record<string, { label: string; action?: () => void; sep?: boolean; shortcut?: string; disabled?: boolean }[]> = {
     File: [
-      { label: 'New…', action: () => setDialog('new'), shortcut: 'Ctrl+N' },
+      { label: 'New…', action: () => setDialog('new') },
       { label: 'Open Project…', action: () => document.getElementById('open-file')!.click() },
       { label: 'Import Image…', action: () => document.getElementById('import-file')!.click() },
       { label: 'sep', sep: true },
@@ -459,11 +543,11 @@ export default function App() {
     View: [
       { label: 'Zoom In', action: () => setZoom(z => Math.min(8, z * 1.25)) },
       { label: 'Zoom Out', action: () => setZoom(z => Math.max(0.05, z / 1.25)) },
-      { label: 'Zoom to Fit', action: () => setZoom(0.6) },
+      { label: 'Zoom to Fit', action: () => { const el = document.querySelector('.workspace'); if (el) setZoom(Math.max(0.05, Math.min(8, Math.min((el.clientWidth - 80) / doc.width, (el.clientHeight - 80) / doc.height)))); } },
       { label: 'Zoom 100%', action: () => setZoom(1) },
-      { label: doc.grid.visible ? 'Hide Grid' : 'Show Grid', action: () => { docRef.current.grid.visible = !docRef.current.grid.visible; bump(); } },
-      { label: 'Add Vertical Guide at Cursor', action: () => { if (cursor) { docRef.current.guides.push({ orientation: 'v', position: cursor.x }); bump(); } } },
-      { label: 'Clear Guides', action: () => { docRef.current.guides = []; bump(); } },
+      { label: doc.grid.visible ? 'Hide Grid' : 'Show Grid', action: () => exec(C.documentCommand('Toggle grid', (dd) => { dd.grid = { ...dd.grid, visible: !dd.grid.visible }; })) },
+      { label: 'Add Vertical Guide at Cursor', action: () => { if (cursor) exec(C.documentCommand('Add guide', (dd) => { dd.guides = [...dd.guides, { orientation: 'v', position: cursor.x }]; })); }, disabled: !cursor },
+      { label: 'Clear Guides', action: () => exec(C.documentCommand('Clear guides', (dd) => { dd.guides = []; })) },
     ],
     Help: [
       { label: 'Keyboard Shortcuts', action: () => setDialog('shortcuts') },
@@ -484,12 +568,12 @@ export default function App() {
               : <button key={i} disabled={it.disabled} onClick={() => { setMenu(null); it.action?.(); }}>{it.label}{it.shortcut && <span className="kbd">{it.shortcut}</span>}</button>)}</div>}
           </div>
         ))}
-        <span style={{ marginLeft: 'auto', color: 'var(--dim)' }}>{doc.name} — {doc.width}×{doc.height}px · {saveState}</span>
+        <span style={{ marginLeft: 'auto', color: 'var(--dim)' }}>{doc.name} — {doc.width}×{doc.height}px</span>
         <input id="open-file" type="file" accept=".wpsc" hidden onChange={e => { const f = e.target.files?.[0]; if (f) openProjectFile(f); e.target.value = ''; }} />
         <input id="import-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={e => { const f = e.target.files?.[0]; if (f) importImageFile(f); e.target.value = ''; }} />
       </div>
       {recovery && <div className="banner">Recovered autosave of “{recovery.docName}” from {new Date(recovery.savedAt).toLocaleString()}.
-        <button onClick={() => { try { docRef.current = deserializeProject(Uint8Array.from(atob(recovery.dataB64), c => c.charCodeAt(0))); histRef.current.clear(); autosaveStore.clear().catch(() => {}); setRecovery(null); bump(); } catch (e) { fail(e); } }}>Restore</button>
+        <button onClick={() => { if (dirty && !window.confirm('Discard unsaved changes and restore the autosave?')) return; try { docRef.current = deserializeProject(Uint8Array.from(atob(recovery.dataB64), c => c.charCodeAt(0))); histRef.current.clear(); autosaveStore.clear().catch(() => {}); setRecovery(null); setDirty(false); bump(); } catch (e) { fail(e); } }}>Restore</button>
         <button onClick={() => { autosaveStore.clear().catch(() => {}); setRecovery(null); }}>Dismiss</button></div>}
       {error && <div className="error-banner" role="alert">⚠ {error}<button style={{ marginLeft: 'auto' }} onClick={() => setError(null)}>Dismiss</button></div>}
       <div className="optionsbar">
@@ -540,7 +624,12 @@ export default function App() {
           <div className="panel-section layers">
             <h3>Layers</h3>
             <div style={{ display: 'flex', gap: 6, marginBottom: 8, flexWrap: 'wrap' }}>
-              <label style={{ flex: 1 }}>Opacity <input type="range" min={0} max={100} value={Math.round((active?.opacity ?? 1) * 100)} onChange={e => active && exec(C.setOpacityCommand(active.id, +e.target.value / 100))} style={{ width: '100%' }} /></label>
+              <label style={{ flex: 1 }}>Opacity <input type="range" min={0} max={100} value={Math.round((active?.opacity ?? 1) * 100)} style={{ width: '100%' }}
+                onPointerDown={() => { if (active) opacityDragRef.current = { layerId: active.id, before: active.opacity }; }}
+                onFocus={() => { if (active && !opacityDragRef.current) opacityDragRef.current = { layerId: active.id, before: active.opacity }; }}
+                onChange={e => { const l = active; if (!l) return; const ly = docRef.current.layers[l.id]; if (ly) { ly.opacity = +e.target.value / 100; bump(); } }}
+                onPointerUp={() => { const d = opacityDragRef.current; opacityDragRef.current = null; if (!d) return; const after = docRef.current.layers[d.layerId]?.opacity; if (after === undefined || after === d.before) return; const b = d.before, a = after; exec({ label: 'Set opacity', do: dd => { const ly = dd.layers[d.layerId]; if (ly) ly.opacity = a; }, undo: dd => { const ly = dd.layers[d.layerId]; if (ly) ly.opacity = b; } }); }}
+                onBlur={() => { const d = opacityDragRef.current; opacityDragRef.current = null; if (!d) return; const after = docRef.current.layers[d.layerId]?.opacity; if (after === undefined || after === d.before) return; const b = d.before, a = after; exec({ label: 'Set opacity', do: dd => { const ly = dd.layers[d.layerId]; if (ly) ly.opacity = a; }, undo: dd => { const ly = dd.layers[d.layerId]; if (ly) ly.opacity = b; } }); }} /></label>
               <select value={active?.blendMode ?? 'normal'} onChange={e => active && exec(C.setBlendCommand(active.id, e.target.value as BlendMode))} aria-label="Blend mode">
                 {BLEND_MODES.map(m => <option key={m} value={m}>{m}</option>)}
               </select>
@@ -551,7 +640,7 @@ export default function App() {
                 onClick={() => { docRef.current.activeLayerId = l.id; bump(); }}
                 onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); docRef.current.activeLayerId = l.id; bump(); } }}>
                 <button aria-label="Toggle visibility" aria-pressed={l.visible} onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { visible: !l.visible }, 'Toggle visibility')); }}>{l.visible ? '◉' : '—'}</button>
-                <span className="thumb" aria-hidden />
+                <LayerThumb doc={doc} layer={l} version={version} />
                 <span className="name" onDoubleClick={() => { const n = prompt('Layer name', l.name); if (n) exec(C.renameLayerCommand(l.id, n)); }}>{l.name}{l.mask ? ' ◧' : ''}</span>
                 <button aria-label="Toggle lock" aria-pressed={l.locked} onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { locked: !l.locked }, 'Toggle lock')); }}>{l.locked ? '⚿' : <span style={{ opacity: 0.35 }}>⚿</span>}</button>
               </div>
@@ -577,7 +666,7 @@ export default function App() {
                 <option value="">Top level</option>
                 {Object.values(doc.layers).filter(l => l.type === 'group').map(g => <option key={g.id} value={g.id}>{g.name}</option>)}
               </select>
-              <button onClick={() => { const sel = document.getElementById('group-target') as HTMLSelectElement; exec(C.moveLayerToGroupCommand(active.id, sel.value || null)); }}>Move</button>
+              <button onClick={() => { const sel = document.getElementById('group-target') as HTMLSelectElement; const target = sel.value || null; if (target === active.parentId) { setError('The layer is already there.'); return; } exec(C.moveLayerToGroupCommand(active.id, target)); }}>Move</button>
             </div>}
           </div>
           <div className="panel-section">
@@ -586,25 +675,33 @@ export default function App() {
               <textarea value={active.text.text} rows={3} style={{ width: '100%', background: '#262626', color: 'var(--text)' }}
                 onChange={e => { const prev = { ...active.text! }; const next = { ...active.text!, text: e.target.value }; exec({ label: 'Edit text', do: d => { const ly = d.layers[active.id]; if (ly) ly.text = { ...next }; }, undo: d => { const ly = d.layers[active.id]; if (ly) ly.text = { ...prev }; } }); }} />
               <div className="grid2" style={{ marginTop: 6 }}>
-                <label>Size <input type="number" value={active.text.fontSize} onChange={e => { active.text!.fontSize = +e.target.value; bump(); }} /></label>
-                <label>Weight <input type="number" value={active.text.fontWeight} step={100} min={100} max={900} onChange={e => { active.text!.fontWeight = +e.target.value; bump(); }} /></label>
-                <label>Color <input type="color" value={rgbaToHex(active.text.color).slice(0, 7)} onChange={e => { const c = hexToRgba(e.target.value); if (c) { active.text!.color = c; bump(); } }} /></label>
-                <label>Align <select value={active.text.align} onChange={e => { active.text!.align = e.target.value as any; bump(); }}><option>left</option><option>center</option><option>right</option></select></label>
+                <label>Size <input type="number" value={active.text.fontSize} onChange={e => { const v = +e.target.value; exec(C.layerDataCommand('Text size', active.id, ly => { ly.text!.fontSize = v; })); }} /></label>
+                <label>Weight <input type="number" value={active.text.fontWeight} step={100} min={100} max={900} onChange={e => { const v = +e.target.value; exec(C.layerDataCommand('Text weight', active.id, ly => { ly.text!.fontWeight = v; })); }} /></label>
+                <label>Color <input type="color" value={rgbaToHex(active.text.color).slice(0, 7)} onChange={e => { const c = hexToRgba(e.target.value); if (c) exec(C.layerDataCommand('Text color', active.id, ly => { ly.text!.color = c; })); }} /></label>
+                <label>Align <select value={active.text.align} onChange={e => { const v = e.target.value as any; exec(C.layerDataCommand('Text align', active.id, ly => { ly.text!.align = v; })); }}><option>left</option><option>center</option><option>right</option></select></label>
               </div>
             </div>}
             {active?.type === 'shape' && active.shape && <div className="grid2">
-              <label>W <input type="number" value={active.shape.w} onChange={e => { active.shape!.w = +e.target.value; bump(); }} /></label>
-              <label>H <input type="number" value={active.shape.h} onChange={e => { active.shape!.h = +e.target.value; bump(); }} /></label>
-              <label>Radius <input type="number" value={active.shape.cornerRadius} onChange={e => { active.shape!.cornerRadius = +e.target.value; bump(); }} /></label>
-              <label>Fill <input type="color" value={active.shape.fill ? rgbaToHex(active.shape.fill).slice(0, 7) : '#000000'} onChange={e => { const c = hexToRgba(e.target.value); if (c) { active.shape!.fill = c; bump(); } }} /></label>
+              <label>W <input type="number" value={active.shape.w} onChange={e => { const v = +e.target.value; exec(C.layerDataCommand('Shape width', active.id, ly => { ly.shape!.w = v; })); }} /></label>
+              <label>H <input type="number" value={active.shape.h} onChange={e => { const v = +e.target.value; exec(C.layerDataCommand('Shape height', active.id, ly => { ly.shape!.h = v; })); }} /></label>
+              <label>Radius <input type="number" value={active.shape.cornerRadius} onChange={e => { const v = +e.target.value; exec(C.layerDataCommand('Shape radius', active.id, ly => { ly.shape!.cornerRadius = v; })); }} /></label>
+              <label>Fill <input type="color" value={active.shape.fill ? rgbaToHex(active.shape.fill).slice(0, 7) : '#000000'} onChange={e => { const c = hexToRgba(e.target.value); if (c) exec(C.layerDataCommand('Shape fill', active.id, ly => { ly.shape!.fill = c; })); }} /></label>
             </div>}
             {active?.type === 'adjustment' && active.adjustment && <div>
-              <label>Kind <select value={active.adjustment.kind} onChange={e => { active.adjustment = { kind: e.target.value as any, params: { brightness: 0, contrast: 0, gamma: 1, inBlack: 0, inWhite: 255, outBlack: 0, outWhite: 255, r: 0, g: 0, b: 0, hue: 0, saturation: 0, lightness: 0, levels: 4, threshold: 128 } }; bump(); }}>
-                {['brightness-contrast','hue-saturation','levels','gamma','color-balance','invert','grayscale','posterize','threshold'].map(k => <option key={k}>{k}</option>)}
+              <label>Kind <select value={active.adjustment.kind} onChange={e => { const kind = e.target.value as any; exec(C.layerDataCommand('Adjustment kind', active.id, ly => { ly.adjustment = { kind, params: adjDefaults(kind) }; })); }}>
+                {Object.keys(ADJ_SCHEMAS).map(k => <option key={k}>{k}</option>)}
               </select></label>
-              {Object.entries(active.adjustment.params).map(([k, v]) => (
-                <label key={k} style={{ display: 'flex', gap: 6, marginTop: 4 }}>{k} <input type="range" min={k === 'gamma' ? 10 : -100} max={k === 'gamma' ? 300 : 255} value={k === 'gamma' ? v * 100 : v} onChange={e => { active.adjustment!.params[k] = k === 'gamma' ? +e.target.value / 100 : +e.target.value; bump(); }} /><span>{v}</span></label>
-              ))}
+              {(ADJ_SCHEMAS[active.adjustment.kind] ?? []).map(s => {
+                const v = active.adjustment!.params[s.key] ?? s.def;
+                return <label key={s.key} style={{ display: 'flex', gap: 6, marginTop: 4 }}>{s.label}
+                  <input type="range" min={s.min} max={s.max} step={s.step ?? 1} value={v}
+                    onPointerDown={() => { adjDragRef.current = { layerId: active.id, before: cloneLayerDeep(active) }; }}
+                    onFocus={() => { if (!adjDragRef.current) adjDragRef.current = { layerId: active.id, before: cloneLayerDeep(active) }; }}
+                    onChange={e => { active.adjustment!.params[s.key] = +e.target.value; bump(); }}
+                    onPointerUp={commitAdjDrag} onBlur={commitAdjDrag} />
+                  <span>{v}</span></label>;
+              })}
+              {(ADJ_SCHEMAS[active.adjustment.kind] ?? []).length === 0 && <p style={{ color: 'var(--dim)', marginTop: 4 }}>This adjustment has no parameters.</p>}
             </div>}
             {active && <div className="grid2" style={{ marginTop: 8 }}>
               <label>X <input type="number" value={Math.round(active.transform.x)} onChange={e => exec(C.transformLayerCommand(active.id, { ...active.transform, x: +e.target.value }))} /></label>
@@ -617,8 +714,9 @@ export default function App() {
           <div className="panel-section">
             <h3>History</h3>
             <div style={{ maxHeight: 110, overflowY: 'auto' }}>
-              {histRef.current.entries().map((en, i) => <div className="hist-row" key={i}>{en.label}</div>)}
-              {histRef.current.depth === 0 && <div className="hist-row">No actions yet</div>}
+              {histRef.current.entries().map((en, i) => <div className={`hist-row${i === histRef.current.entries().length - 1 ? ' current' : ''}`} key={i}>{en.label}</div>)}
+              {histRef.current.redoLabels().slice().reverse().map((label, i) => <div className="hist-row future" key={'r' + i}>{label}</div>)}
+              {histRef.current.depth === 0 && histRef.current.redoLabels().length === 0 && <div className="hist-row">No actions yet</div>}
             </div>
             <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
               <button onClick={undo} disabled={!histRef.current.canUndo()}>Undo</button>
@@ -633,12 +731,13 @@ export default function App() {
         <input type="range" min={5} max={400} value={zoom * 100} onChange={e => setZoom(+e.target.value / 100)} style={{ width: 110 }} aria-label="Zoom" />
         <button onClick={() => setZoom(z => Math.min(8, z * 1.25))}>+</button>
         <span>{cursor ? `${cursor.x}, ${cursor.y}px` : ''}</span>
-        <span>{flattenTree(doc).length} layers · {selMode} selection</span>
+        <span>{flattenTree(doc).length} layers{selection ? ` · ${selectionBounds(selection)?.w ?? 0}×${selectionBounds(selection)?.h ?? 0}px selected` : ''}</span>
         <span className="spacer" />
         <span aria-live="polite">{saveState}</span>
       </div>
       {dialog && <Dialogs name={dialog} close={() => setDialog(null)} doc={doc}
-        onNew={(w, h, n, bgc) => { docRef.current = createDocument(w, h, n, bgc); histRef.current.clear(); setSelection(null); setDirty(false); bump(); }}
+        onExport={(fmt) => exportImage(fmt)}
+        onNew={(w, h, n, bgc) => { if (dirty && !window.confirm('Discard unsaved changes and start a new document?')) return; docRef.current = createDocument(w, h, n, bgc); histRef.current.clear(); setSelection(null); setDirty(false); bump(); }}
         onResizeImage={(w, h) => exec(C.documentCommand('Image size', (dd) => { for (const ly of Object.values(dd.layers)) if (ly.pixels) { ly.pixels = resizeBuffer(ly.pixels, w, h, 'bilinear'); ly.mask = undefined; } dd.width = w; dd.height = h; }))}
         onCanvasSize={(w, h) => exec(C.documentCommand('Canvas size', (dd) => { for (const ly of Object.values(dd.layers)) if (ly.pixels) { const out = createPixelBuffer(w, h); const ox = Math.round((w - ly.pixels.width) / 2), oy = Math.round((h - ly.pixels.height) / 2); for (let y = 0; y < ly.pixels.height; y++) for (let x = 0; x < ly.pixels.width; x++) { const tx = x + ox, ty = y + oy; if (tx < 0 || ty < 0 || tx >= w || ty >= h) continue; const si = (y * ly.pixels.width + x) * 4, ti = (ty * w + tx) * 4; for (let k = 0; k < 4; k++) out.data[ti + k] = ly.pixels.data[si + k]!; } ly.pixels = out; ly.mask = undefined; } dd.width = w; dd.height = h; }))}
       />}
@@ -646,11 +745,13 @@ export default function App() {
   );
 }
 
-function Dialogs({ name, close, doc, onNew, onResizeImage, onCanvasSize }: {
+function Dialogs({ name, close, doc, onNew, onResizeImage, onCanvasSize, onExport }: {
   name: string; close: () => void; doc: EditorDocument;
   onNew: (w: number, h: number, n: string, bg: RGBA) => void;
   onResizeImage: (w: number, h: number) => void; onCanvasSize: (w: number, h: number) => void;
+  onExport: (fmt: 'png' | 'jpeg' | 'webp') => void;
 }) {
+  const [fmt, setFmt] = useState<'png' | 'jpeg' | 'webp'>('png');
   const [w, setW] = useState(doc.width); const [h, setH] = useState(doc.height);
   const [n, setN] = useState('Untitled'); const [bgc, setBgc] = useState('#ffffff');
   const dlgRef = useRef<HTMLDivElement>(null);
@@ -686,8 +787,12 @@ function Dialogs({ name, close, doc, onNew, onResizeImage, onCanvasSize }: {
     <div className="row"><label>Height</label><input type="number" value={h} onChange={e => setH(+e.target.value)} /></div>
     <p style={{ color: 'var(--dim)' }}>Anchor: center. Layers keep their pixels; the canvas grows/shrinks around them.</p>
   </>, () => onCanvasSize(w, h));
+  if (name === 'export') return wrap('Export Image', <>
+    <div className="row"><label>Format</label><select value={fmt} onChange={e => setFmt(e.target.value as any)}><option value="png">PNG (lossless, transparency)</option><option value="jpeg">JPEG (flattened on white)</option><option value="webp">WebP</option></select></div>
+    <p style={{ color: 'var(--dim)' }}>Exports the flattened composite at document size. The document itself is not changed.</p>
+  </>, () => onExport(fmt));
   if (name === 'shortcuts') return wrap('Keyboard Shortcuts', <div>
-    {[['Undo', 'Ctrl/Cmd+Z'], ['Redo', 'Ctrl/Cmd+Shift+Z / Ctrl+Y'], ['Save Project', 'Ctrl/Cmd+S'], ['Select All', 'Ctrl/Cmd+A'], ['Deselect', 'Ctrl/Cmd+D'], ['Brush', 'B'], ['Eraser', 'E'], ['Move', 'V'], ['Marquee', 'M'], ['Lasso', 'L'], ['Text', 'T'], ['Eyedropper', 'I'], ['Zoom', 'Z'], ['Brush size', '[ and ]'], ['Clear selection', 'Delete']].map(([a, b]) => <div className="row" key={a}><label>{a}</label><span className="kbd">{b}</span></div>)}
+    {[['Undo', 'Ctrl/Cmd+Z'], ['Redo', 'Ctrl/Cmd+Shift+Z / Ctrl+Y'], ['Save Project', 'Ctrl/Cmd+S'], ['Export…', 'Ctrl/Cmd+Shift+S'], ['Select All', 'Ctrl/Cmd+A'], ['Deselect', 'Ctrl/Cmd+D'], ['Brush', 'B'], ['Eraser', 'E'], ['Move', 'V'], ['Marquee', 'M (Shift+M cycles)'], ['Lasso', 'L'], ['Text', 'T'], ['Eyedropper', 'I'], ['Zoom', 'Z'], ['Swap FG/BG', 'X'], ['Brush size', '[ and ]'], ['Clear selection', 'Delete']].map(([a, b]) => <div className="row" key={a}><label>{a}</label><span className="kbd">{b}</span></div>)}
   </div>);
   if (name === 'limitations') return wrap('Browser Limitations', <div style={{ lineHeight: 1.6 }}>
     <p>No native filesystem access without a picker, no Photoshop plugins, no proprietary PSD internals (PSD is not supported in v1 — use the native .wpsc format), no OS font installation (browser fonts only), no printer/scanner drivers, no Adobe services. Text is rendered with the browser Canvas2D font engine. Full list: docs/browser-limitations.md in the repo.</p>

@@ -197,6 +197,43 @@ export function transformLayerCommand(layerId: string, t: Transform2D, label = '
 export function maskCommand(label: string, layerId: string, apply: (l: Layer) => void): Command {
   return pixelCommand(label, layerId, apply);
 }
+
+/** Command over a layer's DATA fields (text/shape/adjustment/fillColor) —
+ * snapshots them before/after so property-panel edits are undoable and
+ * dirty-tracked like every other edit (UI audit P1-1: these used to mutate
+ * the layer directly, invisible to history and autosave). */
+export function layerDataCommand(label: string, layerId: string, apply: (l: Layer) => void): Command {
+  let before: Layer | undefined, after: Layer | undefined;
+  const fields = (src: Layer, dst: Layer) => {
+    const c = cloneLayerDeep(src);
+    dst.text = c.text; dst.shape = c.shape; dst.adjustment = c.adjustment; dst.fillColor = c.fillColor;
+  };
+  return {
+    label,
+    do(doc) {
+      const l = doc.layers[layerId]; if (!l) return;
+      if (!before) before = cloneLayerDeep(l);
+      if (after) { fields(after, l); return; }
+      apply(l);
+      after = cloneLayerDeep(l);
+    },
+    undo(doc) { const l = doc.layers[layerId]; if (l && before) fields(before, l); },
+  };
+}
+
+/** Command built from explicit before/after layer snapshots — for drag
+ * interactions (sliders) that mutate live and commit once at drag end. */
+export function layerDataSnapshotCommand(label: string, layerId: string, before: Layer, after: Layer): Command {
+  const fields = (src: Layer, dst: Layer) => {
+    const c = cloneLayerDeep(src);
+    dst.text = c.text; dst.shape = c.shape; dst.adjustment = c.adjustment; dst.fillColor = c.fillColor;
+  };
+  return {
+    label,
+    do(doc) { const l = doc.layers[layerId]; if (l) fields(after, l); },
+    undo(doc) { const l = doc.layers[layerId]; if (l) fields(before, l); },
+  };
+}
 export function setBlendCommand(layerId: string, mode: BlendMode): Command {
   return setLayerPropsCommand(layerId, { blendMode: mode }, 'Set blend mode');
 }

@@ -165,6 +165,7 @@ for (const [menuName, item, dialogTitle] of [['File', 'New…', 'New Document'],
   });
 }
 await step('New Document dialog creates a 400x300 doc', async () => {
+  page.once('dialog', d => d.accept()); // unsaved-changes guard (wave 2c)
   await menu('File'); await menuItem('New…');
   const dlg = page.locator('.dialog');
   await dlg.locator('.row input').nth(1).fill('400');
@@ -199,6 +200,28 @@ await step('import image adds a layer', async () => {
   await page.locator('#import-file').setInputFiles('qa/exported.png');
   await page.waitForTimeout(500);
   check('import adds a layer', (await rows()) === before + 1, `${before} -> ${await rows()}`);
+});
+
+/* ---------- wave 2c: adjustment schema, export dialog, thumbnails ---------- */
+await step('adjustment panel shows only the active kind params (2 sliders for brightness-contrast)', async () => {
+  await menu('Layer'); await menuItem('New Adjustment Layer');
+  const sliders = page.locator('.panel-section').last().locator('input[type=range]');
+  // Properties section is the second-to-last panel section; count range inputs within the adjustment block
+  const propsText = await page.locator('.sidepanel').innerText();
+  check('adjustment kind select present', propsText.includes('brightness-contrast'));
+  const adjSection = page.locator('.panel-section', { hasText: 'Properties' });
+  const n = await adjSection.locator('input[type=range]').count();
+  check('brightness-contrast renders exactly 2 param sliders', n === 2, `${n}`);
+  const thumbs = await page.locator('.layer-row canvas.thumb').count();
+  check('layer rows have real canvas thumbnails', thumbs >= 2, `${thumbs}`);
+});
+await step('Ctrl+Shift+S opens the Export dialog (not About)', async () => {
+  await page.keyboard.press('Control+Shift+s');
+  await page.waitForTimeout(200);
+  const h = await page.locator('.dialog h2').innerText().catch(() => '');
+  check('export dialog opens', h.includes('Export'), h);
+  await page.keyboard.press('Escape');
+  check('export dialog closes on Escape', (await page.locator('.dialog').count()) === 0);
 });
 
 /* ---------- keyboard ---------- */

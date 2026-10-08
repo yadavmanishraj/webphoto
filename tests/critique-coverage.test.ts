@@ -1,3 +1,4 @@
+import { cloneLayerDeep } from "../src/core/document";
 import { describe, it, expect } from 'vitest';
 import { LIMITS, PixelBuffer, RGBA, Selection } from '../src/core/contracts';
 import {
@@ -537,5 +538,41 @@ describe('limits and history capacity', () => {
     expect(hist.canRedo()).toBe(false);
     expect(hist.depth).toBe(0);
     expect(hist.redo(doc)).toBe(false);
+  });
+});
+
+describe('wave 2c: layerDataCommand (property edits are real history)', () => {
+  it('adjustment param edits undo/redo exactly and never alias snapshots', () => {
+    const doc = createDocument(4, 4, 't', WHITE);
+    const h = new History();
+    const adj = createLayer('adjustment', 4, 4, 'adj');
+    adj.adjustment = { kind: 'brightness-contrast', params: { brightness: 0, contrast: 0 } };
+    h.execute(C.addLayerCommand(adj), doc);
+    const id = adj.id;
+    h.execute(C.layerDataCommand('Adjust brightness-contrast', id, ly => { ly.adjustment!.params.brightness = 40; }), doc);
+    expect(doc.layers[id]!.adjustment!.params.brightness).toBe(40);
+    h.undo(doc);
+    expect(doc.layers[id]!.adjustment!.params.brightness).toBe(0);
+    h.redo(doc);
+    expect(doc.layers[id]!.adjustment!.params.brightness).toBe(40);
+    // Mutating the live layer afterwards must not corrupt the snapshot.
+    doc.layers[id]!.adjustment!.params.brightness = 99;
+    h.undo(doc);
+    expect(doc.layers[id]!.adjustment!.params.brightness).toBe(0);
+  });
+  it('layerDataSnapshotCommand applies explicit before/after (slider drag commit)', () => {
+    const doc = createDocument(4, 4, 't', WHITE);
+    const h = new History();
+    const s = createLayer('shape', 4, 4, 'box');
+    h.execute(C.addLayerCommand(s), doc);
+    const before = cloneLayerDeep(doc.layers[s.id]!);
+    doc.layers[s.id]!.shape!.w = 3;
+    const after = cloneLayerDeep(doc.layers[s.id]!);
+    h.execute(C.layerDataSnapshotCommand('Shape width', s.id, before, after), doc);
+    expect(doc.layers[s.id]!.shape!.w).toBe(3);
+    h.undo(doc);
+    expect(doc.layers[s.id]!.shape!.w).not.toBe(3);
+    h.redo(doc);
+    expect(doc.layers[s.id]!.shape!.w).toBe(3);
   });
 });

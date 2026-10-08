@@ -49,6 +49,7 @@ canvas.display { display: block; }
 .dialog .row label { width: 110px; color: var(--dim); } .dialog .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 .banner { background: #5b4a12; color: #ffe9a8; padding: 8px 12px; display: flex; gap: 10px; align-items: center; }
 .error-banner { background: #5c1f1f; color: #ffb4b4; padding: 8px 12px; display: flex; gap: 10px; }
-.hist-row { padding: 3px 6px; color: var(--dim); } .hist-row:last-child { color: var(--text); }
+.hist-row { padding: 3px 6px; color: var(--dim); } .hist-row.current { color: var(--text); font-weight: 600; } .hist-row.future { opacity: .45; font-style: italic; }
+.dialog { width: min(380px, calc(100vw - 32px)); }
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .kbd { background: #222; border: 1px solid #555; border-radius: 3px; padding: 0 4px; font-family: monospace; font-size: 11px; }

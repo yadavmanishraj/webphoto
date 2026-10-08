@@ -156,6 +156,7 @@ export default function App() {
   const [shapeKind, setShapeKind] = useState<'rectangle' | 'ellipse' | 'rounded-rectangle' | 'polygon' | 'line'>('rectangle');
   const [paintTargetMode, setPaintTargetMode] = useState<'pixels' | 'mask'>('pixels');
   const dragRef = useRef<any>(null);
+  const spaceRef = useRef<Tool | null>(null);
   const adjDragRef = useRef<{ layerId: string; before: Layer } | null>(null);
   const opacityDragRef = useRef<{ layerId: string; before: number } | null>(null);
   const doc = docRef.current;
@@ -242,15 +243,38 @@ export default function App() {
   useEffect(() => {
     const store = autosaveStore;
     store.load().then(r => { if (r) setRecovery(r); }).catch(() => {});
-    const iv = setInterval(() => {
-      if (!dirty) return;
+    const saveNow = () => {
       setSaveState('Saving…');
       store.save(makeRecoveryRecord(docRef.current))
         .then(() => { setDirty(false); setSaveState('Autosaved ' + new Date().toLocaleTimeString()); })
         .catch(() => setSaveState('Autosave failed (storage unavailable)'));
-    }, 15000);
-    return () => clearInterval(iv);
+    };
+    // Save soon after edits settle (3s debounce), not only on the 15s tick —
+    // bounds worst-case loss if the tab dies (UX research P0).
+    const deb = setTimeout(() => { if (dirty) saveNow(); }, 3000);
+    const iv = setInterval(() => { if (dirty) saveNow(); }, 15000);
+    return () => { clearTimeout(deb); clearInterval(iv); };
   }, [dirty]);
+
+  /* Warn before the tab closes with unsaved changes (UX research P0). */
+  useEffect(() => {
+    if (!dirty) return;
+    const h = (e: BeforeUnloadEvent) => { e.preventDefault(); };
+    window.addEventListener('beforeunload', h);
+    return () => window.removeEventListener('beforeunload', h);
+  }, [dirty]);
+
+  /* Ctrl/Cmd+wheel zooms (non-passive so the page doesn't scroll-zoom). */
+  useEffect(() => {
+    const cv = canvasRef.current; if (!cv) return;
+    const h = (e: WheelEvent) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      e.preventDefault();
+      setZoom(z => Math.max(0.05, Math.min(8, z * (e.deltaY < 0 ? 1.1 : 1 / 1.1))));
+    };
+    cv.addEventListener('wheel', h, { passive: false });
+    return () => cv.removeEventListener('wheel', h);
+  }, []);
 
   /* ---------- pointer ---------- */
   const getPos = (e: React.PointerEvent) => {
@@ -482,16 +506,24 @@ export default function App() {
       if (mod && e.key.toLowerCase() === 's') { e.preventDefault(); e.shiftKey ? setDialog('export') : saveProject(); return; }
       if (mod && e.key.toLowerCase() === 'a' && !inField) { e.preventDefault(); setSelection(fullSelection(docRef.current.width, docRef.current.height)); return; }
       if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); setSelection(null); return; }
+      if (mod && e.key === '0') { e.preventDefault(); const el = document.querySelector('.workspace'); if (el) setZoom(Math.max(0.05, Math.min(8, Math.min((el.clientWidth - 80) / docRef.current.width, (el.clientHeight - 80) / docRef.current.height)))); return; }
+      if (mod && e.key === '1') { e.preventDefault(); setZoom(1); return; }
       if (inField) return;
       if (!mod && e.key.toLowerCase() === 'x') { setFg(bg); setBg(fg); return; }
       if (!mod && e.key.toUpperCase() === 'M') { setTool(e.shiftKey ? (tool === 'rect-select' ? 'ellipse-select' : 'rect-select') : 'rect-select'); return; }
+      if (!mod && e.key.toUpperCase() === 'G') { setTool(e.shiftKey ? (tool === 'fill' ? 'gradient' : 'fill') : 'fill'); return; }
+      if (!mod && e.key === ' ') { e.preventDefault(); if (!spaceRef.current) { spaceRef.current = tool; setTool('hand'); } return; }
       const t = TOOLS.find(x => x.key === e.key.toUpperCase());
       if (t && !mod) setTool(t.id);
       if (e.key === 'Delete' || e.key === 'Backspace') { if (selection) deleteSelectionPixels(); }
       if (e.key === '[') setBrush(b => ({ ...b, size: Math.max(1, b.size - 2) }));
       if (e.key === ']') setBrush(b => ({ ...b, size: b.size + 2 }));
     };
-    window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
+    const up = (e: KeyboardEvent) => {
+      if (e.key === ' ' && spaceRef.current) { setTool(spaceRef.current); spaceRef.current = null; }
+    };
+    window.addEventListener('keydown', h); window.addEventListener('keyup', up);
+    return () => { window.removeEventListener('keydown', h); window.removeEventListener('keyup', up); };
   });
 
   const menus: Record<string, { label: string; action?: () => void; sep?: boolean; shortcut?: string; disabled?: boolean }[]> = {
@@ -792,7 +824,7 @@ function Dialogs({ name, close, doc, onNew, onResizeImage, onCanvasSize, onExpor
     <p style={{ color: 'var(--dim)' }}>Exports the flattened composite at document size. The document itself is not changed.</p>
   </>, () => onExport(fmt));
   if (name === 'shortcuts') return wrap('Keyboard Shortcuts', <div>
-    {[['Undo', 'Ctrl/Cmd+Z'], ['Redo', 'Ctrl/Cmd+Shift+Z / Ctrl+Y'], ['Save Project', 'Ctrl/Cmd+S'], ['Export…', 'Ctrl/Cmd+Shift+S'], ['Select All', 'Ctrl/Cmd+A'], ['Deselect', 'Ctrl/Cmd+D'], ['Brush', 'B'], ['Eraser', 'E'], ['Move', 'V'], ['Marquee', 'M (Shift+M cycles)'], ['Lasso', 'L'], ['Text', 'T'], ['Eyedropper', 'I'], ['Zoom', 'Z'], ['Swap FG/BG', 'X'], ['Brush size', '[ and ]'], ['Clear selection', 'Delete']].map(([a, b]) => <div className="row" key={a}><label>{a}</label><span className="kbd">{b}</span></div>)}
+    {[['Undo', 'Ctrl/Cmd+Z'], ['Redo', 'Ctrl/Cmd+Shift+Z / Ctrl+Y'], ['Save Project', 'Ctrl/Cmd+S'], ['Export…', 'Ctrl/Cmd+Shift+S'], ['Select All', 'Ctrl/Cmd+A'], ['Deselect', 'Ctrl/Cmd+D'], ['Brush', 'B'], ['Eraser', 'E'], ['Move', 'V'], ['Marquee', 'M (Shift+M cycles)'], ['Lasso', 'L'], ['Text', 'T'], ['Eyedropper', 'I'], ['Zoom', 'Z'], ['Swap FG/BG', 'X'], ['Brush size', '[ and ]'], ['Clear selection', 'Delete'], ['Pan (hold)', 'Space'], ['Zoom to Fit', 'Ctrl/Cmd+0'], ['Zoom 100%', 'Ctrl/Cmd+1'], ['Zoom', 'Ctrl/Cmd + mouse wheel']].map(([a, b]) => <div className="row" key={a}><label>{a}</label><span className="kbd">{b}</span></div>)}
   </div>);
   if (name === 'limitations') return wrap('Browser Limitations', <div style={{ lineHeight: 1.6 }}>
     <p>No native filesystem access without a picker, no Photoshop plugins, no proprietary PSD internals (PSD is not supported in v1 — use the native .wpsc format), no OS font installation (browser fonts only), no printer/scanner drivers, no Adobe services. Text is rendered with the browser Canvas2D font engine. Full list: docs/browser-limitations.md in the repo.</p>

@@ -224,6 +224,25 @@ await step('Ctrl+Shift+S opens the Export dialog (not About)', async () => {
   check('export dialog closes on Escape', (await page.locator('.dialog').count()) === 0);
 });
 
+await step('ctrl+wheel zooms and spacebar holds the hand tool', async () => {
+  const before = await page.locator('.statusbar').innerText();
+  const b = await canvasBox();
+  await page.mouse.move(b.x + 100, b.y + 100);
+  await page.keyboard.down('Control');
+  await page.mouse.wheel(0, -400);
+  await page.keyboard.up('Control');
+  await page.waitForTimeout(150);
+  const after = await page.locator('.statusbar').innerText();
+  check('ctrl+wheel changes zoom %', before.split('·')[0] !== after.split('·')[0] || /%/.test(after), `${before.slice(0, 6)} -> ${after.slice(0, 6)}`);
+  await page.keyboard.press('b'); // known starting tool (flow may have left Hand active)
+  await page.keyboard.down(' ');
+  await page.waitForTimeout(120);
+  check('spacebar switches to hand (options hint)', (await page.locator('.optionsbar').innerText()).includes('pan'));
+  await page.keyboard.up(' ');
+  await page.waitForTimeout(120);
+  check('spacebar release restores the tool', (await page.locator('.optionsbar').innerText()).includes('Hardness'));
+});
+
 /* ---------- keyboard ---------- */
 await step('keyboard tool switching + select all', async () => {
   await page.locator('body').click({ position: { x: 10, y: 300 } });

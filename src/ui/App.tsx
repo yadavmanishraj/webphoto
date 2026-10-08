@@ -345,6 +345,11 @@ export default function App() {
     if (f.size > LIMITS.maxImportBytes) { setError(`Image is too large (max ${Math.round(LIMITS.maxImportBytes / 1048576)} MB).`); return; }
     if (f.type === 'image/svg+xml') { setError('SVG import is not supported — import a PNG, JPEG, WebP or GIF instead.'); return; }
     createImageBitmap(f).then(bmp => {
+      if (bmp.width > LIMITS.maxDimension || bmp.height > LIMITS.maxDimension) {
+        bmp.close();
+        setError(`Image dimensions ${bmp.width}×${bmp.height} exceed the ${LIMITS.maxDimension}px limit.`);
+        return;
+      }
       const d = docRef.current;
       const scale = Math.min(1, d.width / bmp.width, d.height / bmp.height);
       const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
@@ -386,6 +391,7 @@ export default function App() {
 
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') { setMenu(null); }
       const inField = /INPUT|TEXTAREA|SELECT/.test((e.target as HTMLElement).tagName);
       const mod = e.ctrlKey || e.metaKey;
       if (mod && e.key.toLowerCase() === 'z') { e.preventDefault(); e.shiftKey ? redo() : undo(); return; }
@@ -472,7 +478,7 @@ export default function App() {
         <span className="title">◧ Web Photoshop Clone</span>
         {Object.entries(menus).map(([name, items]) => (
           <div className="menu" key={name}>
-            <button onClick={() => setMenu(menu === name ? null : name)} aria-haspopup="menu">{name}</button>
+            <button onClick={() => setMenu(menu === name ? null : name)} aria-haspopup="menu" aria-expanded={menu === name}>{name}</button>
             {menu === name && <div className="dropdown" role="menu">{items.map((it, i) => it.sep
               ? <div className="sep" key={i} />
               : <button key={i} disabled={it.disabled} onClick={() => { setMenu(null); it.action?.(); }}>{it.label}{it.shortcut && <span className="kbd">{it.shortcut}</span>}</button>)}</div>}
@@ -485,7 +491,7 @@ export default function App() {
       {recovery && <div className="banner">Recovered autosave of “{recovery.docName}” from {new Date(recovery.savedAt).toLocaleString()}.
         <button onClick={() => { try { docRef.current = deserializeProject(Uint8Array.from(atob(recovery.dataB64), c => c.charCodeAt(0))); histRef.current.clear(); autosaveStore.clear().catch(() => {}); setRecovery(null); bump(); } catch (e) { fail(e); } }}>Restore</button>
         <button onClick={() => { autosaveStore.clear().catch(() => {}); setRecovery(null); }}>Dismiss</button></div>}
-      {error && <div className="error-banner">⚠ {error}<button style={{ marginLeft: 'auto' }} onClick={() => setError(null)}>Dismiss</button></div>}
+      {error && <div className="error-banner" role="alert">⚠ {error}<button style={{ marginLeft: 'auto' }} onClick={() => setError(null)}>Dismiss</button></div>}
       <div className="optionsbar">
         {(tool === 'brush' || tool === 'eraser') && <>
           <label>Size <input type="range" min={1} max={300} value={brush.size} onChange={e => setBrush({ ...brush, size: +e.target.value })} /><input type="number" value={brush.size} onChange={e => setBrush({ ...brush, size: +e.target.value })} /></label>
@@ -629,7 +635,7 @@ export default function App() {
         <span>{cursor ? `${cursor.x}, ${cursor.y}px` : ''}</span>
         <span>{flattenTree(doc).length} layers · {selMode} selection</span>
         <span className="spacer" />
-        <span>{saveState}</span>
+        <span aria-live="polite">{saveState}</span>
       </div>
       {dialog && <Dialogs name={dialog} close={() => setDialog(null)} doc={doc}
         onNew={(w, h, n, bgc) => { docRef.current = createDocument(w, h, n, bgc); histRef.current.clear(); setSelection(null); setDirty(false); bump(); }}

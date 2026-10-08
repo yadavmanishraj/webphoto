@@ -77,7 +77,15 @@ function renderList(doc: EditorDocument, ids: string[]): PixelBuffer {
       buf = layerOwnBuffer(doc, l);
     }
     if (!buf) continue;
-    buf = applyTransform({ width: buf.width, height: buf.height, data: new Uint8ClampedArray(buf.data) }, l);
+    // The defensive copy below exists only because mask/clip mutate the
+    // buffer in place: skip it when nothing downstream can mutate the
+    // layer's own pixels (perf audit P1 — most layers have neither).
+    // Group buffers are already fresh accumulators; transformed buffers
+    // are resampled into fresh ones by applyTransform.
+    const identityPath = l.type === 'shape' || (l.transform.rotationDeg === 0 && l.transform.scaleX === 1 && l.transform.scaleY === 1 && l.transform.x === 0 && l.transform.y === 0);
+    const canMutate = identityPath && ((!!l.mask && l.maskEnabled) || l.clipped);
+    if (canMutate && l.type !== 'group') buf = { width: buf.width, height: buf.height, data: new Uint8ClampedArray(buf.data) };
+    buf = applyTransform(buf, l);
     applyMaskAlpha(buf, l);
     if (l.clipped && prevAlpha) {
       for (let p = 0; p < acc.width * acc.height; p++)

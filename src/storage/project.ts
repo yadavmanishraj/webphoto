@@ -68,6 +68,16 @@ function validateGraph(manifest: Manifest): void {
   }
   for (const [id, n] of membership) if (n !== 1) bad(`Layer ${id} appears ${n} times in the tree`);
   if (membership.size !== manifest.layers.length) bad('Layer tree does not cover every layer (cycle or orphan)');
+  // Depth cap: the renderer holds one full-frame accumulator per nesting
+  // level, so an unbounded-depth file is a memory-amplification vector
+  // (security audit P2). 64 is far beyond any real document.
+  const MAX_GROUP_DEPTH = 64;
+  const depthOf = new Map<string, number>();
+  const walkDepth = (ids: string[], d: number): void => {
+    if (d > MAX_GROUP_DEPTH) bad(`Group nesting exceeds ${MAX_GROUP_DEPTH} levels`);
+    for (const id of ids) { depthOf.set(id, d); const l = byId.get(id); if (l?.type === 'group') walkDepth(l.childIds ?? [], d + 1); }
+  };
+  walkDepth(manifest.doc.rootIds, 1);
   if (manifest.doc.activeLayerId !== null && !ids.has(manifest.doc.activeLayerId))
     bad(`Dangling activeLayerId ${manifest.doc.activeLayerId}`);
 }

@@ -1,6 +1,6 @@
 import { BlendMode, Command, EditorDocument, Layer, Transform2D } from './contracts';
 import {
-  addLayerToDoc, cloneDocument, cloneMask, clonePixels, createLayer,
+  addLayerToDoc, cloneDocument, cloneLayerDeep, cloneMask, clonePixels, createLayer,
   removeLayerFromDoc, siblingIds,
 } from './document';
 
@@ -50,10 +50,12 @@ export function addLayerCommand(layer: Layer, parentId: string | null = null): C
     label: `Add ${layer.type} layer`,
     do(doc) {
       if (prevActive === undefined) prevActive = doc.activeLayerId;
-      addLayerToDoc(doc, layer, parentId, index); doc.activeLayerId = layer.id;
+      // Insert a deep clone, never the held template itself (RT2-1/A).
+      addLayerToDoc(doc, cloneLayerDeep(layer), parentId, index); doc.activeLayerId = layer.id;
     },
     undo(doc) {
-      index = siblingIds(doc, layer).indexOf(layer.id);
+      const list = parentId ? (doc.layers[parentId]?.childIds ?? doc.rootIds) : doc.rootIds;
+      index = list.indexOf(layer.id);
       removeLayerFromDoc(doc, layer.id);
       // Restore the layer that was active before the add (red-team RT-2).
       if (prevActive && doc.layers[prevActive]) doc.activeLayerId = prevActive;
@@ -103,19 +105,28 @@ export function duplicateLayerCommand(layerId: string): Command {
     rootCopy = mk(src, src.parentId);
     clones = all;
   };
+  let prevActive: string | null | undefined;
   return {
     label: 'Duplicate layer',
     do(doc) {
       const src = doc.layers[layerId]; if (!src) return;
+      if (prevActive === undefined) prevActive = doc.activeLayerId;
       if (!clones || !rootCopy) build(doc);
       if (!clones || !rootCopy) return;
-      for (const c of clones) doc.layers[c.id] = c;
+      // Insert deep clones of the built templates on every do() — the
+      // templates must stay pristine across undo/redo (RT2-1/A).
+      for (const c of clones) doc.layers[c.id] = cloneLayerDeep(c);
       const list = src.parentId ? doc.layers[src.parentId]!.childIds : doc.rootIds;
       const idx = list.indexOf(layerId);
       list.splice(idx < 0 ? 0 : idx, 0, rootCopy.id);
       doc.activeLayerId = rootCopy.id;
     },
-    undo(doc) { if (rootCopy) removeLayerFromDoc(doc, rootCopy.id); },
+    undo(doc) {
+      if (rootCopy) removeLayerFromDoc(doc, rootCopy.id);
+      // Restore the previously active layer (RT2-1/B — RT1 fixed this for
+      // add/remove but duplicate and group creation were missed).
+      if (prevActive && doc.layers[prevActive]) doc.activeLayerId = prevActive;
+    },
   };
 }
 export function renameLayerCommand(layerId: string, name: string): Command {
@@ -194,9 +205,20 @@ export function setOpacityCommand(layerId: string, opacity: number): Command {
 }
 export function createGroupCommand(name = 'Group'): Command {
   let group: Layer | undefined;
+  let prevActive: string | null | undefined;
   return {
     label: 'Create group',
-    do(doc) { if (!group) group = createLayer('group', doc.width, doc.height, name); addLayerToDoc(doc, group, null, 0); doc.activeLayerId = group.id; },
-    undo(doc) { if (group) removeLayerFromDoc(doc, group.id); },
+    do(doc) {
+      if (prevActive === undefined) prevActive = doc.activeLayerId;
+      if (!group) group = createLayer('group', doc.width, doc.height, name);
+      // Clone-on-insert (RT2-1/A): the held group object must never enter
+      // the document — moveLayerToGroup mutates the in-doc object's
+      // childIds, and redo would resurrect that mutated object.
+      addLayerToDoc(doc, cloneLayerDeep(group), null, 0); doc.activeLayerId = group.id;
+    },
+    undo(doc) {
+      if (group) removeLayerFromDoc(doc, group.id);
+      if (prevActive && doc.layers[prevActive]) doc.activeLayerId = prevActive;
+    },
   };
 }

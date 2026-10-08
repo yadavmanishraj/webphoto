@@ -133,3 +133,16 @@ export function cloneDocument(doc: EditorDocument): EditorDocument {
   };
 }
 export function countLayers(doc: EditorDocument): number { return Object.keys(doc.layers).length; }
+/** Deep-clone a single layer (same id; pixels/mask/sub-objects copied).
+ * Commands that insert layers MUST insert a clone of their held template
+ * on every do(): inserting the held object itself lets later in-place
+ * mutations (e.g. moveLayerToGroup pushing into childIds) corrupt the
+ * template, and a subsequent redo then resurrects the mutated object
+ * (red-team RT2-1/A). */
+export function cloneLayerDeep(l: Layer): Layer {
+  const pseudo = {
+    layers: { [l.id]: l }, rootIds: [], background: transparent,
+    guides: [], grid: { visible: false, spacing: 32, snap: false },
+  } as unknown as EditorDocument;
+  return cloneDocument(pseudo).layers[l.id]!;
+}

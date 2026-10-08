@@ -44,6 +44,14 @@ function validateGraph(manifest: Manifest): void {
     if (typeof m.opacity !== 'number' || !Number.isFinite(m.opacity) || m.opacity < 0 || m.opacity > 1)
       bad(`Invalid opacity for layer ${m.id}`);
   }
+  const byId = new Map(manifest.layers.map(l => [l.id, l]));
+  for (const m of manifest.layers) {
+    // A non-finite gradient angle cannot survive JSON (NaN serializes to
+    // null); reject it as corrupt instead of silently loading a mutated
+    // value (red-team RT2 probe P-B).
+    if (m.gradient !== undefined && (typeof m.gradient.angleDeg !== 'number' || !Number.isFinite(m.gradient.angleDeg)))
+      bad(`Invalid gradient angle for layer ${m.id}`);
+  }
   const membership = new Map<string, number>();
   const mark = (id: string) => membership.set(id, (membership.get(id) ?? 0) + 1);
   for (const id of manifest.doc.rootIds) { if (!ids.has(id)) bad(`Dangling rootId ${id}`); mark(id); }
@@ -52,7 +60,7 @@ function validateGraph(manifest: Manifest): void {
     for (const cid of m.childIds ?? []) {
       if (!ids.has(cid)) bad(`Dangling childId ${cid} in ${m.id}`);
       mark(cid);
-      const child = manifest.layers.find(l => l.id === cid)!;
+      const child = byId.get(cid)!;
       if (child.parentId !== m.id) bad(`Layer ${cid} parentId does not match its group`);
     }
     if (m.parentId !== null && !ids.has(m.parentId)) bad(`Dangling parentId ${m.parentId}`);

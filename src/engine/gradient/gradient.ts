@@ -35,7 +35,7 @@ export function renderGradient(w: number, h: number, g: GradientData): PixelBuff
   const halfDiag = diag / 2;
   const cx = w / 2;
   const cy = h / 2;
-  const rad = (g.angleDeg * Math.PI) / 180;
+  const rad = ((Number.isFinite(g.angleDeg) ? g.angleDeg : 0) * Math.PI) / 180;
   const dirX = Math.cos(rad);
   const dirY = Math.sin(rad);
   for (let y = 0; y < h; y++) {

@@ -34,5 +34,12 @@ not faked. This document is the record.
 - Group duplicate clones children with fresh ids; nested-group duplicate is shallow-tested.
 - Adjustment layers apply to the composite below them (standard semantics), but
   clipped adjustments are not yet scoped to a single layer's alpha beyond `clipped` flag on raster layers.
-- SVG import goes through the browser image decoder (scripts in SVG images are
-  inert in `<img>`/createImageBitmap contexts); SVG is never inserted as live DOM.
+- SVG import is not supported in the UI (rejected with a message); the format
+  itself is never inserted as live DOM anywhere.
+- Painting (brush/eraser/fill/clear/fill-selection) on a layer accounts for
+  the layer's x/y translation; rotation and non-uniform scale are applied at
+  render time and are not inverse-mapped for painting (painting on a rotated
+  or scaled layer is therefore approximate — flatten/apply the transform
+  first for pixel-exact work). Added in critique wave 2 (2026-10-08), which
+  also fixed command template aliasing (clone-on-insert), group/duplicate
+  undo active-layer restoration, and recovery-dismiss persistence.

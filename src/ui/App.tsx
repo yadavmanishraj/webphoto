@@ -22,6 +22,22 @@ import { hexToRgba, rgbaToHex } from '../engine/color/color';
 import { buildFontString, layoutText } from '../engine/text/textLayout';
 import { serializeProject, deserializeProject } from '../storage/project';
 import { IndexedDbAutosaveStore, makeRecoveryRecord, RecoveryRecord } from '../storage/autosave';
+import { LIMITS } from '../core/contracts';
+
+const autosaveStore = new IndexedDbAutosaveStore();
+
+/** Shift a doc-space selection into a layer's local space (layers render
+ * offset by transform.x/y, so painting must index the mask in layer
+ * coordinates — design/a11y audit F7). */
+function shiftSelection(sel: Selection, dx: number, dy: number): Selection {
+  if (dx === 0 && dy === 0) return sel;
+  const mask = new Uint8Array(sel.width * sel.height);
+  for (let y = 0; y < sel.height; y++) for (let x = 0; x < sel.width; x++) {
+    const sx = x - dx, sy = y - dy;
+    if (sx >= 0 && sy >= 0 && sx < sel.width && sy < sel.height) mask[y * sel.width + x] = sel.mask[sy * sel.width + sx]!;
+  }
+  return { width: sel.width, height: sel.height, mask };
+}
 
 type Tool = 'move' | 'brush' | 'eraser' | 'rect-select' | 'ellipse-select' | 'lasso' | 'eyedropper' | 'fill' | 'text' | 'shape' | 'gradient' | 'crop' | 'hand' | 'zoom';
 const TOOLS: { id: Tool; icon: string; label: string; key: string }[] = [
@@ -29,16 +45,16 @@ const TOOLS: { id: Tool; icon: string; label: string; key: string }[] = [
   { id: 'rect-select', icon: '▭', label: 'Rectangular Marquee', key: 'M' },
   { id: 'ellipse-select', icon: '◯', label: 'Elliptical Marquee', key: 'M' },
   { id: 'lasso', icon: '⌒', label: 'Lasso', key: 'L' },
-  { id: 'brush', icon: '🖌', label: 'Brush', key: 'B' },
+  { id: 'brush', icon: '✎', label: 'Brush', key: 'B' },
   { id: 'eraser', icon: '⌫', label: 'Eraser', key: 'E' },
-  { id: 'fill', icon: '🪣', label: 'Paint Bucket', key: 'G' },
+  { id: 'fill', icon: '◩', label: 'Paint Bucket', key: 'G' },
   { id: 'gradient', icon: '◐', label: 'Gradient', key: 'G' },
-  { id: 'eyedropper', icon: '💧', label: 'Eyedropper', key: 'I' },
+  { id: 'eyedropper', icon: '⌖', label: 'Eyedropper', key: 'I' },
   { id: 'text', icon: 'T', label: 'Text', key: 'T' },
   { id: 'shape', icon: '▢', label: 'Shape', key: 'U' },
   { id: 'crop', icon: '⌐', label: 'Crop', key: 'C' },
-  { id: 'hand', icon: '✋', label: 'Hand', key: 'H' },
-  { id: 'zoom', icon: '🔍', label: 'Zoom', key: 'Z' },
+  { id: 'hand', icon: '☞', label: 'Hand', key: 'H' },
+  { id: 'zoom', icon: '⊕', label: 'Zoom', key: 'Z' },
 ];
 const PALETTE = ['#000000','#ffffff','#ff0000','#ff7f00','#ffff00','#00c853','#2680eb','#7b1fa2','#795548','#9e9e9e','#00bcd4','#e91e63','#8bc34a','#3f51b5'];
 
@@ -71,7 +87,7 @@ export default function App() {
   const [version, setVersion] = useState(0);
   const [tool, setTool] = useState<Tool>('brush');
   const [fg, setFg] = useState<RGBA>({ r: 17, g: 17, b: 17, a: 255 });
-  const [bg] = useState<RGBA>({ r: 255, g: 255, b: 255, a: 255 });
+  const [bg, setBg] = useState<RGBA>({ r: 255, g: 255, b: 255, a: 255 });
   const [brush, setBrush] = useState<BrushSettings>({ size: 24, hardness: 0.8, opacity: 1, flow: 1, spacing: 0.25, roundness: 1, angleDeg: 0 });
   const [zoom, setZoom] = useState(0.6);
   const [selection, setSelection] = useState<Selection | null>(null);
@@ -133,17 +149,24 @@ export default function App() {
     for (const g of d.guides) { ctx.beginPath(); if (g.orientation === 'v') { ctx.moveTo(g.position + .5, 0); ctx.lineTo(g.position + .5, d.height); } else { ctx.moveTo(0, g.position + .5); ctx.lineTo(d.width, g.position + .5); } ctx.stroke(); }
     if (selection) {
       const img = ctx.createImageData(d.width, d.height);
-      for (let i = 0; i < selection.mask.length; i++) if (selection.mask[i]! > 0) { img.data[i * 4] = 38; img.data[i * 4 + 1] = 128; img.data[i * 4 + 2] = 235; img.data[i * 4 + 3] = 70; }
+      const m = selection.mask, sw = selection.width, sh = selection.height;
+      for (let y = 0; y < sh; y++) for (let x = 0; x < sw; x++) {
+        const i = y * sw + x; if (m[i]! === 0) continue;
+        img.data[i * 4] = 38; img.data[i * 4 + 1] = 128; img.data[i * 4 + 2] = 235; img.data[i * 4 + 3] = 70;
+        // True selection outline (not just the bounding box): a selected
+        // pixel bordering an unselected one becomes an opaque white edge.
+        const edge = x === 0 || y === 0 || x === sw - 1 || y === sh - 1 ||
+          m[i - 1] === 0 || m[i + 1] === 0 || m[i - sw] === 0 || m[i + sw] === 0;
+        if (edge) { img.data[i * 4] = 255; img.data[i * 4 + 1] = 255; img.data[i * 4 + 2] = 255; img.data[i * 4 + 3] = 220; }
+      }
       const sc = document.createElement('canvas'); sc.width = d.width; sc.height = d.height;
       sc.getContext('2d')!.putImageData(img, 0, 0); ctx.drawImage(sc, 0, 0);
-      const b = selectionBounds(selection);
-      if (b) { ctx.strokeStyle = '#fff'; ctx.setLineDash([6, 4]); ctx.strokeRect(b.x + .5, b.y + .5, b.w, b.h); ctx.setLineDash([]); }
     }
   }, [version, selection]);
 
   /* ---------- autosave / recovery ---------- */
   useEffect(() => {
-    const store = new IndexedDbAutosaveStore();
+    const store = autosaveStore;
     store.load().then(r => { if (r) setRecovery(r); }).catch(() => {});
     const iv = setInterval(() => {
       if (!dirty) return;
@@ -186,6 +209,7 @@ export default function App() {
     }
     if (tool === 'text') {
       const l = createLayer('text', d.width, d.height); l.transform.x = p.x; l.transform.y = p.y;
+      if (l.text) l.text.color = { ...fg };
       exec(C.addLayerCommand(l)); setTool('move'); return;
     }
     if (tool === 'shape' || tool === 'gradient' || tool === 'crop' || tool === 'rect-select' || tool === 'ellipse-select' || tool === 'lasso' || tool === 'move') {
@@ -197,7 +221,9 @@ export default function App() {
     const l = paintTarget(); if (!l) { if (active?.locked) setError('Layer is locked.'); return; }
     if (tool === 'fill') {
       if (!l.pixels) return;
-      exec(C.pixelCommand('Paint bucket', l.id, (ly) => floodFill(ly.pixels!, p.x, p.y, fg, 32, selection)));
+      const t = l.transform;
+      const selLocal = selection ? shiftSelection(selection, -t.x, -t.y) : null;
+      exec(C.pixelCommand('Paint bucket', l.id, (ly) => floodFill(ly.pixels!, p.x - t.x, p.y - t.y, fg, 32, selLocal)));
       return;
     }
     const before = clonePixels(l.pixels); const beforeMask = cloneMask(l.mask);
@@ -207,24 +233,35 @@ export default function App() {
       maskBuf = createPixelBuffer(l.mask!.width, l.mask!.height);
       for (let i = 0; i < l.mask!.data.length; i++) { const v = l.mask!.data[i]!; maskBuf.data[i * 4] = v; maskBuf.data[i * 4 + 1] = v; maskBuf.data[i * 4 + 2] = v; maskBuf.data[i * 4 + 3] = 255; }
     }
-    dragRef.current = { tool, layerId: l.id, before, beforeMask, points: [p], maskPaint, maskBuf };
+    dragRef.current = { tool, layerId: l.id, before, beforeMask, points: [p], maskPaint, maskBuf,
+      selLocal: selection ? shiftSelection(selection, -l.transform.x, -l.transform.y) : null };
     applyStroke([p], e);
   };
+  const rafRef = useRef(false);
+  const scheduleBump = useCallback(() => {
+    if (rafRef.current) return; rafRef.current = true;
+    requestAnimationFrame(() => { rafRef.current = false; bump(); });
+  }, [bump]);
   const applyStroke = (pts: { x: number; y: number; pressure?: number }[], _e?: React.PointerEvent) => {
     const drag = dragRef.current; if (!drag?.layerId) return;
     const l = docRef.current.layers[drag.layerId]; if (!l) return;
+    // Points arrive in document space; layer buffers are layer-local and
+    // render offset by transform.x/y — translate before painting (F7).
+    const t = l.transform;
+    const local = pts.map(p => ({ ...p, x: p.x - t.x, y: p.y - t.y }));
+    const sel = (drag.selLocal ?? undefined) as Selection | undefined;
     if (drag.maskPaint && drag.maskBuf && l.mask) {
       // Mask painting: brush paints the foreground's luminance as gray
       // (white reveals, black hides); eraser paints black (hides).
       const lum = Math.round(0.2126 * fg.r + 0.7152 * fg.g + 0.0722 * fg.b);
       const col: RGBA = tool === 'eraser' ? { r: 0, g: 0, b: 0, a: 255 } : { r: lum, g: lum, b: lum, a: 255 };
-      paintStroke(drag.maskBuf, pts, brush, col, 'paint', selection ?? undefined);
+      paintStroke(drag.maskBuf, local, brush, col, 'paint', sel);
       for (let i = 0; i < l.mask.data.length; i++) l.mask.data[i] = drag.maskBuf.data[i * 4]!;
-      bump(); return;
+      scheduleBump(); return;
     }
     if (!l.pixels) return;
-    paintStroke(l.pixels, pts, brush, fg, tool === 'eraser' ? 'erase' : 'paint', selection ?? undefined);
-    bump();
+    paintStroke(l.pixels, local, brush, fg, tool === 'eraser' ? 'erase' : 'paint', sel);
+    scheduleBump();
   };
   const onMove = (e: React.PointerEvent) => {
     const d = docRef.current; const p = getPos(e); setCursor(p);
@@ -297,11 +334,16 @@ export default function App() {
     } catch (e) { fail(e); }
   };
   const saveProject = () => { try { download(new Blob([serializeProject(docRef.current) as BlobPart], { type: 'application/octet-stream' }), `${docRef.current.name}.wpsc`); setSaveState('Project saved'); setDirty(false); } catch (e) { fail(e); } };
-  const openProjectFile = (f: File) => f.arrayBuffer().then(ab => {
+  const openProjectFile = (f: File) => {
+    if (f.size > LIMITS.maxProjectBytes) { setError('Project file exceeds the size limit.'); return; }
+    f.arrayBuffer().then(ab => {
     try { docRef.current = deserializeProject(new Uint8Array(ab)); histRef.current.clear(); setSelection(null); setDirty(false); bump(); }
     catch (e) { fail(e); }
-  }).catch(fail);
+    }).catch(fail);
+  };
   const importImageFile = (f: File) => {
+    if (f.size > LIMITS.maxImportBytes) { setError(`Image is too large (max ${Math.round(LIMITS.maxImportBytes / 1048576)} MB).`); return; }
+    if (f.type === 'image/svg+xml') { setError('SVG import is not supported — import a PNG, JPEG, WebP or GIF instead.'); return; }
     createImageBitmap(f).then(bmp => {
       const d = docRef.current;
       const scale = Math.min(1, d.width / bmp.width, d.height / bmp.height);
@@ -336,8 +378,9 @@ export default function App() {
   };
   const deleteSelectionPixels = () => {
     const l = active; if (!l?.pixels || !selection) return;
+    const sel = shiftSelection(selection, -l.transform.x, -l.transform.y);
     exec(C.pixelCommand('Clear selection', l.id, (ly) => {
-      for (let i = 0; i < selection.mask.length; i++) { const a = selection.mask[i]! / 255; ly.pixels!.data[i * 4 + 3] = Math.round(ly.pixels!.data[i * 4 + 3]! * (1 - a)); }
+      for (let i = 0; i < sel.mask.length; i++) { const a = sel.mask[i]! / 255; ly.pixels!.data[i * 4 + 3] = Math.round(ly.pixels!.data[i * 4 + 3]! * (1 - a)); }
     }));
   };
 
@@ -351,6 +394,7 @@ export default function App() {
       if (mod && e.key.toLowerCase() === 'a' && !inField) { e.preventDefault(); setSelection(fullSelection(docRef.current.width, docRef.current.height)); return; }
       if (mod && e.key.toLowerCase() === 'd') { e.preventDefault(); setSelection(null); return; }
       if (inField) return;
+      if (!mod && e.key.toLowerCase() === 'x') { setFg(bg); setBg(fg); return; }
       const t = TOOLS.find(x => x.key === e.key.toUpperCase());
       if (t && !mod) setTool(t.id);
       if (e.key === 'Delete' || e.key === 'Backspace') { if (selection) deleteSelectionPixels(); }
@@ -360,7 +404,7 @@ export default function App() {
     window.addEventListener('keydown', h); return () => window.removeEventListener('keydown', h);
   });
 
-  const menus: Record<string, { label: string; action?: () => void; sep?: boolean; shortcut?: string }[]> = {
+  const menus: Record<string, { label: string; action?: () => void; sep?: boolean; shortcut?: string; disabled?: boolean }[]> = {
     File: [
       { label: 'New…', action: () => setDialog('new'), shortcut: 'Ctrl+N' },
       { label: 'Open Project…', action: () => document.getElementById('open-file')!.click() },
@@ -372,10 +416,10 @@ export default function App() {
       { label: 'Export WebP', action: () => exportImage('webp') },
     ],
     Edit: [
-      { label: 'Undo', action: undo, shortcut: 'Ctrl+Z' }, { label: 'Redo', action: redo, shortcut: 'Ctrl+Shift+Z' },
+      { label: 'Undo', action: undo, shortcut: 'Ctrl+Z', disabled: !histRef.current.canUndo() }, { label: 'Redo', action: redo, shortcut: 'Ctrl+Shift+Z', disabled: !histRef.current.canRedo() },
       { label: 'sep', sep: true },
-      { label: 'Clear Selection Pixels', action: deleteSelectionPixels, shortcut: 'Del' },
-      { label: 'Fill Selection with Foreground', action: () => { const l = active; if (l?.pixels && selection) exec(C.pixelCommand('Fill', l.id, (ly) => { for (let i = 0; i < selection.mask.length; i++) if (selection.mask[i]) { ly.pixels!.data[i * 4] = fg.r; ly.pixels!.data[i * 4 + 1] = fg.g; ly.pixels!.data[i * 4 + 2] = fg.b; ly.pixels!.data[i * 4 + 3] = fg.a; } })); } },
+      { label: 'Clear Selection Pixels', action: deleteSelectionPixels, shortcut: 'Del', disabled: !selection },
+      { label: 'Fill Selection with Foreground', action: () => { const l = active; if (l?.pixels && selection) { const sel = shiftSelection(selection, -l.transform.x, -l.transform.y); exec(C.pixelCommand('Fill', l.id, (ly) => { for (let i = 0; i < sel.mask.length; i++) if (sel.mask[i]) { ly.pixels!.data[i * 4] = fg.r; ly.pixels!.data[i * 4 + 1] = fg.g; ly.pixels!.data[i * 4 + 2] = fg.b; ly.pixels!.data[i * 4 + 3] = fg.a; } })); } } },
     ],
     Image: [
       { label: 'Image Size…', action: () => setDialog('resize-image') },
@@ -400,10 +444,10 @@ export default function App() {
     Select: [
       { label: 'All', action: () => setSelection(fullSelection(doc.width, doc.height)), shortcut: 'Ctrl+A' },
       { label: 'Deselect', action: () => setSelection(null), shortcut: 'Ctrl+D' },
-      { label: 'Invert', action: () => selection && setSelection(invertSelection(selection)) },
-      { label: 'Feather 5px', action: () => selection && setSelection(featherSelection(selection, 5)) },
-      { label: 'Grow 2px', action: () => selection && setSelection(growSelection(selection, 2)) },
-      { label: 'Shrink 2px', action: () => selection && setSelection(shrinkSelection(selection, 2)) },
+      { label: 'Invert', action: () => selection && setSelection(invertSelection(selection)), disabled: !selection },
+      { label: 'Feather 5px', action: () => selection && setSelection(featherSelection(selection, 5)), disabled: !selection },
+      { label: 'Grow 2px', action: () => selection && setSelection(growSelection(selection, 2)), disabled: !selection },
+      { label: 'Shrink 2px', action: () => selection && setSelection(shrinkSelection(selection, 2)), disabled: !selection },
     ],
     Filter: ['Gaussian Blur','Sharpen','Noise','Pixelate','Emboss','Edge Detect','Invert','Grayscale','Posterize','Threshold','Brightness +20','Contrast +20'].map(n => ({ label: n, action: () => applyFilter(n) })),
     View: [
@@ -431,16 +475,16 @@ export default function App() {
             <button onClick={() => setMenu(menu === name ? null : name)} aria-haspopup="menu">{name}</button>
             {menu === name && <div className="dropdown" role="menu">{items.map((it, i) => it.sep
               ? <div className="sep" key={i} />
-              : <button key={i} onClick={() => { setMenu(null); it.action?.(); }}>{it.label}{it.shortcut && <span className="kbd">{it.shortcut}</span>}</button>)}</div>}
+              : <button key={i} disabled={it.disabled} onClick={() => { setMenu(null); it.action?.(); }}>{it.label}{it.shortcut && <span className="kbd">{it.shortcut}</span>}</button>)}</div>}
           </div>
         ))}
         <span style={{ marginLeft: 'auto', color: 'var(--dim)' }}>{doc.name} — {doc.width}×{doc.height}px · {saveState}</span>
         <input id="open-file" type="file" accept=".wpsc" hidden onChange={e => { const f = e.target.files?.[0]; if (f) openProjectFile(f); e.target.value = ''; }} />
-        <input id="import-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml" hidden onChange={e => { const f = e.target.files?.[0]; if (f) importImageFile(f); e.target.value = ''; }} />
+        <input id="import-file" type="file" accept="image/png,image/jpeg,image/webp,image/gif" hidden onChange={e => { const f = e.target.files?.[0]; if (f) importImageFile(f); e.target.value = ''; }} />
       </div>
       {recovery && <div className="banner">Recovered autosave of “{recovery.docName}” from {new Date(recovery.savedAt).toLocaleString()}.
-        <button onClick={() => { try { docRef.current = deserializeProject(Uint8Array.from(atob(recovery.dataB64), c => c.charCodeAt(0))); histRef.current.clear(); setRecovery(null); bump(); } catch (e) { fail(e); } }}>Restore</button>
-        <button onClick={() => setRecovery(null)}>Dismiss</button></div>}
+        <button onClick={() => { try { docRef.current = deserializeProject(Uint8Array.from(atob(recovery.dataB64), c => c.charCodeAt(0))); histRef.current.clear(); autosaveStore.clear().catch(() => {}); setRecovery(null); bump(); } catch (e) { fail(e); } }}>Restore</button>
+        <button onClick={() => { autosaveStore.clear().catch(() => {}); setRecovery(null); }}>Dismiss</button></div>}
       {error && <div className="error-banner">⚠ {error}<button style={{ marginLeft: 'auto' }} onClick={() => setError(null)}>Dismiss</button></div>}
       <div className="optionsbar">
         {(tool === 'brush' || tool === 'eraser') && <>
@@ -460,9 +504,9 @@ export default function App() {
       </div>
       <div className="main">
         <div className="toolbar" role="toolbar" aria-label="Tools">
-          {TOOLS.map(t => <button key={t.id} className={tool === t.id ? 'active' : ''} title={`${t.label} (${t.key})`} aria-label={t.label} onClick={() => setTool(t.id)}>{t.icon}</button>)}
+          {TOOLS.map(t => <button key={t.id} className={tool === t.id ? 'active' : ''} title={`${t.label} (${t.key})`} aria-label={t.label} aria-pressed={tool === t.id} onClick={() => setTool(t.id)}>{t.icon}</button>)}
           <div style={{ marginTop: 'auto' }} className="fgbg">
-            <div title="Foreground / Background (X swaps display only)">
+            <div title="Foreground / Background (X swaps)">
               <div className="chip" style={{ background: rgbaToHex(bg), width: 22, height: 22, marginLeft: 10 }} />
               <div className="chip" style={{ background: rgbaToHex(fg), width: 26, height: 26, marginTop: -14 }} />
             </div>
@@ -481,6 +525,7 @@ export default function App() {
             <h3>Color</h3>
             <div className="fgbg" style={{ marginBottom: 8 }}>
               <label>FG <input type="color" value={rgbaToHex(fg).slice(0, 7)} onChange={e => { const c = hexToRgba(e.target.value); if (c) setFg({ ...c, a: fg.a }); }} /></label>
+              <label>BG <input type="color" value={rgbaToHex(bg).slice(0, 7)} onChange={e => { const c = hexToRgba(e.target.value); if (c) setBg({ ...c, a: bg.a }); }} /></label>
               <input value={rgbaToHex(fg)} onChange={e => { const c = hexToRgba(e.target.value); if (c) setFg(c); }} aria-label="Foreground hex" style={{ width: 84 }} />
               <label>Alpha <input type="range" min={0} max={255} value={fg.a} onChange={e => setFg({ ...fg, a: +e.target.value })} style={{ width: 70 }} /></label>
             </div>
@@ -496,11 +541,13 @@ export default function App() {
             </div>
             {flattenTree(doc).map(({ layer: l, depth }) => (
               <div key={l.id} className={`layer-row ${doc.activeLayerId === l.id ? 'selected' : ''}`} style={{ marginLeft: depth * 14 }}
-                onClick={() => { docRef.current.activeLayerId = l.id; bump(); }}>
-                <button aria-label="Toggle visibility" onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { visible: !l.visible }, 'Toggle visibility')); }}>{l.visible ? '👁' : '—'}</button>
+                role="button" tabIndex={0} aria-pressed={doc.activeLayerId === l.id}
+                onClick={() => { docRef.current.activeLayerId = l.id; bump(); }}
+                onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); docRef.current.activeLayerId = l.id; bump(); } }}>
+                <button aria-label="Toggle visibility" aria-pressed={l.visible} onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { visible: !l.visible }, 'Toggle visibility')); }}>{l.visible ? '◉' : '—'}</button>
                 <span className="thumb" aria-hidden />
                 <span className="name" onDoubleClick={() => { const n = prompt('Layer name', l.name); if (n) exec(C.renameLayerCommand(l.id, n)); }}>{l.name}{l.mask ? ' ◧' : ''}</span>
-                <button aria-label="Toggle lock" onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { locked: !l.locked }, 'Toggle lock')); }}>{l.locked ? '🔒' : '🔓'}</button>
+                <button aria-label="Toggle lock" aria-pressed={l.locked} onClick={e => { e.stopPropagation(); exec(C.setLayerPropsCommand(l.id, { locked: !l.locked }, 'Toggle lock')); }}>{l.locked ? '⚿' : <span style={{ opacity: 0.35 }}>⚿</span>}</button>
               </div>
             ))}
             <div style={{ display: 'flex', gap: 4, marginTop: 8, flexWrap: 'wrap' }}>
@@ -600,8 +647,18 @@ function Dialogs({ name, close, doc, onNew, onResizeImage, onCanvasSize }: {
 }) {
   const [w, setW] = useState(doc.width); const [h, setH] = useState(doc.height);
   const [n, setN] = useState('Untitled'); const [bgc, setBgc] = useState('#ffffff');
+  const dlgRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    // Initial focus into the dialog + Escape closes (audit: dialogs had
+    // neither). Backdrop dismissal is mousedown-left-button only, so a
+    // middle-click paste attempt can't destroy dialog input.
+    (dlgRef.current?.querySelector('input, select, textarea') as HTMLElement | null)?.focus();
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [name, close]);
   const wrap = (title: string, body: React.ReactNode, onOk?: () => void) => (
-    <div className="dialog-backdrop" onClick={close}><div className="dialog" role="dialog" aria-modal="true" aria-label={title} onClick={e => e.stopPropagation()}>
+    <div className="dialog-backdrop" onMouseDown={e => { if (e.target === e.currentTarget && e.button === 0) close(); }}><div className="dialog" ref={dlgRef} role="dialog" aria-modal="true" aria-label={title}>
       <h2>{title}</h2>{body}
       <div className="actions"><button onClick={close}>Cancel</button>{onOk && <button className="active" onClick={() => { onOk(); close(); }}>OK</button>}</div>
     </div></div>

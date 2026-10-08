@@ -4,6 +4,9 @@ html,body,#root { height: 100%; }
 body { font-family: Inter, system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 12px; overflow: hidden; }
 button { background: var(--panel2); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 8px; cursor: pointer; font-size: 12px; }
 button:hover { background: #4a4a4a; } button:disabled { opacity: .4; cursor: default; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.dropdown button:disabled { opacity: .45; cursor: default; }
+.dropdown button:disabled:hover { background: transparent; }
 button.active { background: var(--accent); color: #fff; }
 input, select { background: #262626; color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; font-size: 12px; }
 input[type=range] { padding: 0; } input[type=color] { padding: 0; height: 24px; width: 40px; }
